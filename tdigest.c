@@ -133,6 +133,9 @@ PG_FUNCTION_INFO_V1(tdigest_recv);
 
 PG_FUNCTION_INFO_V1(tdigest_count);
 
+PG_FUNCTION_INFO_V1(tdigest_add_double_increment);
+PG_FUNCTION_INFO_V1(tdigest_union_double_increment);
+
 Datum tdigest_add_double_array(PG_FUNCTION_ARGS);
 Datum tdigest_add_double_array_values(PG_FUNCTION_ARGS);
 Datum tdigest_add_double(PG_FUNCTION_ARGS);
@@ -160,6 +163,9 @@ Datum tdigest_send(PG_FUNCTION_ARGS);
 Datum tdigest_recv(PG_FUNCTION_ARGS);
 
 Datum tdigest_count(PG_FUNCTION_ARGS);
+
+Datum tdigest_add_double_increment(PG_FUNCTION_ARGS);
+Datum tdigest_union_double_increment(PG_FUNCTION_ARGS);
 
 static Datum double_to_array(FunctionCallInfo fcinfo, double * d, int len);
 static double *array_to_double(FunctionCallInfo fcinfo, ArrayType *v, int * len);
@@ -867,6 +873,145 @@ tdigest_add_double(PG_FUNCTION_ARGS)
 
 	PG_RETURN_POINTER(state);
 }
+
+/*
+ * Add a value to the tdigest (create one if needed). Transition function
+ * for tdigest aggregate with a single percentile.
+ */
+Datum
+tdigest_add_double_increment(PG_FUNCTION_ARGS)
+{
+	int					i;
+	tdigest_aggstate_t *state;
+	tdigest_t		   *digest;
+
+	/*
+	 * We want to skip NULL values altogether - we return either the
+	 * existing t-digest (if it already exists) or NULL.
+	 */
+	if (PG_ARGISNULL(1))
+	{
+		if (PG_ARGISNULL(0))
+			PG_RETURN_NULL();
+
+		/* if there already is a state accumulated, don't forget it */
+		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+	}
+
+	/* if there's no aggregate state allocated, create it now */
+	if (!PG_ARGISNULL(0))
+	{
+		digest = (tdigest_t *) PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
+
+		/* make sure the t-digest format is supported */
+		if (digest->flags != 0)
+			elog(ERROR, "unsupported t-digest on-disk format");
+
+		state = tdigest_aggstate_allocate(0, 0, digest->compression);
+
+		/* copy data from the tdigest into the aggstate */
+		for (i = 0; i < digest->ncentroids; i++)
+			tdigest_add_centroid(state, digest->centroids[i].sum,
+								 digest->centroids[i].count);
+	}
+	else
+	{
+		int		compression = PG_GETARG_INT32(2);
+
+		check_compression(compression);
+
+		state = tdigest_aggstate_allocate(0, 0, compression);
+	}
+
+	/* finally add the new point */
+	tdigest_add(state, PG_GETARG_FLOAT8(1));
+
+	digest = tdigest_aggstate_to_digest(state);
+
+	PG_RETURN_POINTER(digest);
+}
+
+Datum
+tdigest_union_double_increment(PG_FUNCTION_ARGS)
+{
+	int	i;
+	tdigest_aggstate_t	 *dst, *src;
+
+	if (PG_ARGISNULL(0) && PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+	else if (PG_ARGISNULL(0))
+		PG_RETURN_POINTER(PG_GETARG_POINTER(1));
+	else if (PG_ARGISNULL(1))
+		PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+
+	/* now we know both arguments are non-null */
+
+	/* parse the first digest */
+	{
+		tdigest_t *digest = (tdigest_t *) PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
+
+		/* make sure the t-digest format is supported */
+		if (digest->flags != 0)
+			elog(ERROR, "unsupported t-digest on-disk format");
+
+		dst = tdigest_aggstate_allocate(0, 0, digest->compression);
+
+		/* copy data from the tdigest into the aggstate */
+		for (i = 0; i < digest->ncentroids; i++)
+			tdigest_add_centroid(dst, digest->centroids[i].sum,
+								 digest->centroids[i].count);
+	}
+
+	/* parse the second digest */
+	{
+		tdigest_t *digest = (tdigest_t *) PG_DETOAST_DATUM(PG_GETARG_DATUM(1));
+
+		/* make sure the t-digest format is supported */
+		if (digest->flags != 0)
+			elog(ERROR, "unsupported t-digest on-disk format");
+
+		src = tdigest_aggstate_allocate(0, 0, digest->compression);
+
+		/* copy data from the tdigest into the aggstate */
+		for (i = 0; i < digest->ncentroids; i++)
+			tdigest_add_centroid(src, digest->centroids[i].sum,
+								 digest->centroids[i].count);
+	}
+
+	/*
+	 * Do a compaction on each digest, to make sure we have enough space.
+	 *
+	 * XXX Maybe do this only when necessary, i.e. when we can't fit the
+	 * data into the dst digest? Also, is it really ensured this gives us
+	 * enough free space?
+	 */
+	tdigest_compact(dst);
+	tdigest_compact(src);
+
+	AssertCheckTDigestAggState(dst);
+	AssertCheckTDigestAggState(src);
+
+	/* copy the second part */
+	memcpy(&dst->centroids[dst->ncentroids],
+		   src->centroids,
+		   src->ncentroids * sizeof(centroid_t));
+
+	dst->ncentroids += src->ncentroids;
+	dst->count += src->count;
+
+	/* XXX We could have do a merge sort above, to save some CPU time. */
+	dst->nsorted = 0;
+
+	/* do compaction of the resulting digest again */
+	tdigest_compact(dst);
+
+	AssertCheckTDigestAggState(dst);
+
+	/* XXX maybe free the digests? */
+
+	PG_RETURN_POINTER(tdigest_aggstate_to_digest(dst));
+}
+
 
 /*
  * Add a value to the tdigest (create one if needed). Transition function
